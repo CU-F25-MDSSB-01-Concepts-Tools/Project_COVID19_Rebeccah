@@ -1,0 +1,1058 @@
+
+---
+title: "Project - COVID19"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    standalone: true
+    embed-resources: true
+    code-fold: false
+    number-sections: true
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE
+)
+
+```
+
+```{r}
+#| label: packages-original-functions
+#| message: false
+#| warning: false
+
+
+library(tidyverse)
+library(lubridate)
+library(janitor)
+library(slider)
+library(corrplot)
+library(correlation)
+
+who <- readr::read_csv("data/WHO-COVID-19(in).csv", show_col_types = FALSE) %>%
+  clean_names() %>%
+  mutate(
+    date_reported = as_date(parse_date_time(date_reported, orders = c("ymd","mdy","dmy"))),
+    new_cases   = replace_na(as.numeric(new_cases), 0),
+    new_deaths  = replace_na(as.numeric(new_deaths), 0)
+  ) %>%
+  mutate(
+    country = dplyr::recode(
+      country,
+      "United Kingdom of Great Britain and Northern Ireland" = "United Kingdom"
+    )
+  ) %>%                               
+  arrange(country, date_reported) %>%
+  group_by(country) %>%
+  mutate(
+    cum_cases = cumsum(new_cases),
+    cum_deaths = cumsum(new_deaths)
+  ) %>%
+  ungroup()
+
+
+wdi <- readr::read_csv("data/WDI(in).csv", show_col_types = FALSE) %>%
+  clean_names()
+
+
+smooth3  <- function(x) (x + lag(x,1,0) + lag(x,2,0)) / 3
+smooth7  <- function(x) Reduce(`+`, lapply(0:6, function(k) lag(x,k,0))) / 7
+smooth10 <- function(x) Reduce(`+`, lapply(0:9, function(k) lag(x,k,0))) / 10
+
+shiftscale <- function(x, shift, scale) scale * lag(x, shift, default = 0)
+
+who <- who %>%
+  group_by(country) %>%
+  mutate(
+    new_cases_smooth3  = smooth3(new_cases),
+    new_cases_smooth7  = smooth7(new_cases),
+    new_cases_smooth10 = smooth10(new_cases),
+    new_deaths_smooth3  = smooth3(new_deaths),
+    new_deaths_smooth7  = smooth7(new_deaths),
+    new_deaths_smooth10 = smooth10(new_deaths)
+  ) %>%
+  ungroup()
+
+  
+```
+
+The first wave of COVID-19 in Germany began in late February 2020, with cases rising rapidly throughout March. Daily new cases reached their first peak in late March to early April, while daily deaths peaked about 1–2 weeks later, reflecting the delay between infection and fatal outcome. After mid-April, both new cases and deaths steadily declined during May and June, indicating the end of the first wave. The jagged pattern in daily case counts is caused by weekly reporting effects, particularly lower weekend reporting followed by corrections mid-week. For this reason, smoothed values provide a clearer picture of the epidemic trend than raw daily data.
+
+```{r add-smoothed-columns, include=FALSE}
+
+who <- who %>%
+  dplyr::group_by(country) %>%
+  dplyr::arrange(date_reported, .by_group = TRUE) %>%
+  dplyr::mutate(
+    new_cases_smooth7  = (new_cases  + dplyr::lag(new_cases,1,0)  + dplyr::lag(new_cases,2,0) +
+                          dplyr::lag(new_cases,3,0) + dplyr::lag(new_cases,4,0) +
+                          dplyr::lag(new_cases,5,0) + dplyr::lag(new_cases,6,0)) / 7,
+    new_deaths_smooth7 = (new_deaths + dplyr::lag(new_deaths,1,0) + dplyr::lag(new_deaths,2,0) +
+                          dplyr::lag(new_deaths,3,0) + dplyr::lag(new_deaths,4,0) +
+                          dplyr::lag(new_deaths,5,0) + dplyr::lag(new_deaths,6,0)) / 7
+  ) %>%
+  dplyr::ungroup()
+```
+
+```{r wavebreak-helpers, include=FALSE}
+if (!exists("smooth7")) {
+  smooth7 <- function(x) {
+    (x + dplyr::lag(x,1,0) + dplyr::lag(x,2,0) + dplyr::lag(x,3,0) +
+       dplyr::lag(x,4,0) + dplyr::lag(x,5,0) + dplyr::lag(x,6,0)) / 7
+  }
+}
+
+# Return a single Date: the day where the 7-day-smoothed cases' difference peaks
+find_wave_break <- function(who_df, country, start, end) {
+  df <- who_df |>
+    dplyr::filter(country == !!country,
+                  date_reported >= as.Date(start),
+                  date_reported <= as.Date(end)) |>
+    dplyr::arrange(date_reported) |>
+    dplyr::mutate(
+      new_cases_smooth7 = smooth7(new_cases),
+      Diff_cases_smooth7 = new_cases_smooth7 - dplyr::lag(new_cases_smooth7, 1)
+    )
+
+  # Safely get index of maximum (ignore NAs from lag)
+  i <- which.max(replace(df$Diff_cases_smooth7, is.na(df$Diff_cases_smooth7), -Inf))
+  df$date_reported[i]
+}
+```
+
+# COVID-19 time evolution {#sec-1}
+```{r germany-wavebreak-One, echo=FALSE, message=FALSE, warning=FALSE}
+
+germany_first_break <- find_wave_break(who, "Germany", "2020-03-01", "2020-06-30"
+)
+
+g1_plot <- who |>
+  dplyr::filter(country == "Germany",
+                date_reported >= as.Date("2020-03-01"),
+                date_reported <= as.Date("2020-06-30")) |>
+  ggplot2::ggplot(ggplot2::aes(date_reported)) +
+  ggplot2::geom_line(ggplot2::aes(y = new_cases_smooth7,  color = "Cases (7-day)"),  linewidth = 1.1) +
+  ggplot2::geom_line(ggplot2::aes(y = new_deaths_smooth7, color = "Deaths (7-day)"), linewidth = 1.1) +
+  ggplot2::geom_vline(xintercept = germany_first_break, linetype = "dashed") +
+  ggplot2::scale_color_manual(values = c("Cases (7-day)"="steelblue", "Deaths (7-day)"="firebrick"), name = "") +
+  ggplot2::labs(
+    title = paste("Germany — First Wave Break:", germany_first_break),
+    x = "Date", y = "Daily counts (smoothed)"
+  ) +
+  ggplot2::theme_minimal()
+
+
+print(g1_plot)
+
+
+```
+
+
+
+Germany’s first major COVID-19 wave began in early March 2020, rising steadily as local outbreaks expanded.
+Daily new cases peaked around late March to early April 2020, while deaths peaked about 1–2 weeks later, reflecting the delay between infection and severe outcomes.
+After mid-April, both cases and deaths declined gradually as strict public health measures and behavior changes took effect.
+```{r four-countries-cumulative, message=FALSE}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(stringr)
+
+# Normalize UK naming to match your dataset
+who4 <- who %>%
+  mutate(country = if_else(
+    str_detect(country, regex("^The United Kingdom$|United Kingdom of Great Britain and Northern Ireland", ignore_case = TRUE)),
+    "The United Kingdom",
+    country
+  ))
+
+four <- c("Italy", "France", "Germany", "The United Kingdom")
+
+who4 <- who4 %>%
+  filter(country %in% four,
+         date_reported >= as.Date("2020-02-15"),
+         date_reported <= as.Date("2020-06-30")) %>%
+  arrange(country, date_reported) %>%
+  group_by(country) %>%
+  mutate(
+    cum_cases  = cumsum(replace_na(new_cases, 0)),
+    cum_deaths = cumsum(replace_na(new_deaths, 0))
+  ) %>%
+  ungroup() %>%
+  mutate(country = factor(country, levels = four))  # keep legend order & show all four
+
+# Cumulative cases
+p_cases <- ggplot(who4, aes(date_reported, cum_cases, color = country)) +
+  geom_line(linewidth = 1) +
+  labs(title = "Cumulative cases — First wave", x = NULL, y = "Cases (cumulative)") +
+  scale_color_discrete(drop = FALSE) +
+  theme_minimal()
+
+# Cumulative deaths
+p_deaths <- ggplot(who4, aes(date_reported, cum_deaths, color = country)) +
+  geom_line(linewidth = 1) +
+  labs(title = "Cumulative deaths — First wave", x = NULL, y = "Deaths (cumulative)") +
+  scale_color_discrete(drop = FALSE) +
+  theme_minimal()
+
+p_cases
+p_deaths
+```
+
+
+The first epidemic wave unfolded differently across the four countries. Italy experienced the earliest and most intense first wave, with cumulative cases and deaths rising sharply from early March. France followed slightly later, showing a steep rise in cases and a comparatively high mortality burden. The United Kingdom began its wave later than Italy and France, but deaths increased rapidly once transmission accelerated, resulting in a higher deaths-to-cases ratio than in Germany. In contrast, Germany’s first wave was considerably milder, with slower growth in cumulative cases and consistently lower cumulative deaths. Overall, Germany’s early outbreak was more effectively contained, while Italy, France, and the UK experienced more severe first-wave impacts.
+
+## Smoothing daily data {#sec-1.3}
+```{r packages-data-functions, message=FALSE}
+library(tidyverse)
+library(janitor)
+library(lubridate)
+
+
+```
+
+```{r 13-smoothing-germany, message=FALSE, warning=FALSE}
+smooth3  <- function(x) (x + dplyr::lag(x,1,0) + dplyr::lag(x,2,0)) / 3
+smooth7  <- function(x) (x + dplyr::lag(x,1,0) + dplyr::lag(x,2,0) +
+                         dplyr::lag(x,3,0) + dplyr::lag(x,4,0) +
+                         dplyr::lag(x,5,0) + dplyr::lag(x,6,0)) / 7
+smooth10 <- function(x) (x + dplyr::lag(x,1,0) + dplyr::lag(x,2,0) +
+                         dplyr::lag(x,3,0) + dplyr::lag(x,4,0) +
+                         dplyr::lag(x,5,0) + dplyr::lag(x,6,0) +
+                         dplyr::lag(x,7,0) + dplyr::lag(x,8,0) +
+                         dplyr::lag(x,9,0)) / 10
+
+de_early <- who %>%
+  filter(country == "Germany",
+         date_reported <= as.Date("2020-08-31")) %>%
+  arrange(date_reported) %>%
+  mutate(
+    cases_s3  = smooth3(new_cases),
+    cases_s7  = smooth7(new_cases),
+    cases_s10 = smooth10(new_cases)
+  ) %>%
+  select(date_reported, cases_s3, cases_s7, cases_s10) %>%
+  pivot_longer(-date_reported, names_to = "window", values_to = "value") %>%
+  mutate(window = factor(window,
+                         levels = c("cases_s3","cases_s7","cases_s10"),
+                         labels = c("3-day MA","7-day MA","10-day MA")))
+
+ggplot(de_early, aes(date_reported, value)) +
+  geom_line(linewidth = 0.9) +
+  facet_wrap(~ window, ncol = 1, scales = "free_y") +
+  labs(title = "Germany — New Cases with 3/7/10-day Moving Averages",
+       x = "Date", y = "Smoothed new cases") +
+  theme_minimal()
+
+
+
+```
+The 3-day smoothing still shows many fluctuations because it reacts very quickly to daily changes, so it reduces noise only slightly. The 7-day smoothing is much more balanced and provides a clearer trend that is easier to interpret. The 10-day smoothing produces the smoothest curve, but it also delays the detection of rises and peaks because it averages over a longer period. Therefore, the 7-day smoothing is the most useful in practice, since it removes most of the noise while still preserving the overall shape and timing of the wave.
+```{r germany-shift-scale}
+
+
+if (!exists("smooth7")) smooth7 <- function(x) (x + dplyr::lag(x,1,0) + dplyr::lag(x,2,0) +
+                                                dplyr::lag(x,3,0) + dplyr::lag(x,4,0) +
+                                                dplyr::lag(x,5,0) + dplyr::lag(x,6,0)) / 7
+
+SHIFT_DAYS <- 10
+SCALE      <- 0.05
+
+make_overlay <- function(start, end) {
+  who %>%
+    filter(country == "Germany",
+           date_reported >= as.Date(start),
+           date_reported <= as.Date(end)) %>%
+    arrange(date_reported) %>%
+    mutate(
+      cases_s7  = smooth7(new_cases),
+      deaths_s7 = smooth7(new_deaths),
+      cases_shifted = dplyr::lag(cases_s7, SHIFT_DAYS) * SCALE
+    ) %>%
+    select(date_reported, cases_shifted, deaths_s7) %>%
+    pivot_longer(-date_reported, names_to = "series", values_to = "value") %>%
+    mutate(series = factor(series,
+                           levels = c("cases_shifted","deaths_s7"),
+                           labels  = c(paste0("Shifted & Scaled Cases (",SHIFT_DAYS,"d, ×",SCALE,")"),
+                                       "Deaths (7-day MA)")))
+}
+
+p1 <- make_overlay("2020-03-01", "2020-04-30")
+p2 <- make_overlay("2020-07-01", "2020-12-31")
+
+ggplot(p1, aes(date_reported, value, color = series)) +
+  geom_line(linewidth = 1) +
+  labs(title = "Germany — First Wave Overlay (Mar–Apr 2020)",
+       x = "Date", y = "Count") + theme_minimal()
+
+ggplot(p2, aes(date_reported, value, color = series)) +
+  geom_line(linewidth = 1) +
+  labs(title = "Germany — Second Wave Overlay (Jul–Dec 2020)",
+       x = "Date", y = "Count") + theme_minimal()
+
+```
+
+
+```{r germany-shift-setup}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(purrr)
+
+germany <- who |>
+  filter(country == "Germany") |>
+  arrange(date_reported) |>
+  mutate(
+    new_cases_smooth7  = (new_cases  + lag(new_cases,1,0)  + lag(new_cases,2,0)  +
+                          lag(new_cases,3,0) + lag(new_cases,4,0) +
+                          lag(new_cases,5,0) + lag(new_cases,6,0)) / 7,
+    new_deaths_smooth7 = (new_deaths + lag(new_deaths,1,0) + lag(new_deaths,2,0) +
+                          lag(new_deaths,3,0) + lag(new_deaths,4,0) +
+                          lag(new_deaths,5,0) + lag(new_deaths,6,0)) / 7
+  )
+
+shiftscale <- function(x, shift, scale) lag(x, n = shift, default = 0) * scale
+```
+
+```{r germany-gridsearch}
+win_from <- as.Date("2020-03-15")
+win_to   <- as.Date("2020-04-15")
+
+grid <- expand_grid(
+  shift = 8:18,
+  scale = seq(0.03, 0.08, by = 0.005)
+) |>
+  mutate(
+    rmse = map2_dbl(shift, scale, ~ {
+      tmp <- germany |>
+        mutate(ss = shiftscale(new_cases_smooth7, shift = .x, scale = .y)) |>
+        filter(date_reported >= win_from, date_reported <= win_to)
+      sqrt(mean((tmp$ss - tmp$new_deaths_smooth7)^2, na.rm = TRUE))
+    })
+  ) |>
+  arrange(rmse)
+
+grid_best <- slice_head(grid, n = 1)
+grid_best
+```
+
+```{r germany-smoothing-comparison, message=FALSE, warning=FALSE}
+
+if (!exists("smooth3"))  smooth3  <- function(x) (x + dplyr::lag(x,1,0) + dplyr::lag(x,2,0)) / 3
+if (!exists("smooth7"))  smooth7  <- function(x) Reduce(`+`, lapply(0:6, function(k) dplyr::lag(x,k,0))) / 7
+if (!exists("smooth10")) smooth10 <- function(x) Reduce(`+`, lapply(0:9, function(k) dplyr::lag(x,k,0))) / 10
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+de <- who %>%
+  filter(country == "Germany") %>%
+  arrange(date_reported) %>%
+  mutate(
+    smooth3  = smooth3(new_cases),
+    smooth7  = smooth7(new_cases),
+    smooth10 = smooth10(new_cases)
+  )
+
+de_long <- de %>%
+  select(date_reported, new_cases, smooth3, smooth7, smooth10) %>%
+  pivot_longer(c(smooth3, smooth7, smooth10),
+               names_to = "window", values_to = "smoothed") %>%
+  mutate(window = factor(window,
+                         levels = c("smooth3","smooth7","smooth10"),
+                         labels = c("3-day smooth","7-day smooth","10-day smooth")))
+ggplot() +
+  geom_line(data = de_long, aes(date_reported, new_cases), color = "grey80") +
+  geom_line(data = de_long, aes(date_reported, smoothed)) +
+  facet_wrap(~ window, nrow = 1) +
+  labs(
+    title = "Germany: Daily New COVID-19 Cases — Smoothing Comparison",
+    subtitle = "Raw series (grey) vs 3-day, 7-day, and 10-day moving averages",
+    x = NULL, y = "Cases (people)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank())
+```
+The different smoothing windows change how much day-to-day variation is removed from the series. The 3-day smoother still shows noticeable short-term fluctuations, including the weekly reporting cycle where fewer cases are recorded on weekends. The 7-day smoother provides a much clearer and more stable trend because it averages over a full weekly reporting period, making it easier to see the underlying pattern of the epidemic. The 10-day smoother produces an even smoother curve, but it begins to lag behind the timing of the real increases and decreases. Therefore, the 7-day moving average offers the best balance between reducing noise and preserving the timing of changes in case numbers.
+
+
+```{r chosen-parameters, include=FALSE}
+chosen_shift <- 8
+chosen_scale <- 0.03
+```
+
+```{r germany-overlap-first-wave, warning=FALSE, message=FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+chosen_shift <- 8
+chosen_scale <- 0.03
+
+g1 <- who %>%
+  filter(country == "Germany", date_reported <= as.Date("2020-06-30")) %>%
+  arrange(date_reported) %>%
+  mutate(
+    nc = tidyr::replace_na(new_cases, 0),
+    nd = tidyr::replace_na(new_deaths, 0),
+    new_cases_smooth7  = (nc + lag(nc,1,0) + lag(nc,2,0) + lag(nc,3,0) +
+                          lag(nc,4,0) + lag(nc,5,0) + lag(nc,6,0)) / 7,
+    new_deaths_smooth7 = (nd + lag(nd,1,0) + lag(nd,2,0) + lag(nd,3,0) +
+                          lag(nd,4,0) + lag(nd,5,0) + lag(nd,6,0)) / 7,
+    shifted_cases      = lag(new_cases_smooth7, n = chosen_shift, default = 0) * chosen_scale
+  ) %>%
+  select(date_reported,
+         `Deaths (7-day)` = new_deaths_smooth7,
+         `Cases (7-day) shifted+scaled` = shifted_cases) %>%
+  pivot_longer(-date_reported, names_to = "series", values_to = "value") %>%
+  mutate(series = factor(series, levels = c("Deaths (7-day)", "Cases (7-day) shifted+scaled")))
+
+ggplot(g1, aes(date_reported, value, color = series)) +
+  geom_line(linewidth = 1) +
+  scale_color_manual(values = c("Deaths (7-day)" = "firebrick",
+                                "Cases (7-day) shifted+scaled" = "steelblue")) +
+  labs(title = paste0("Germany — First wave overlap (shift = ",
+                      chosen_shift, ", scale = ", chosen_scale, ")"),
+       x = "Date", y = "Daily counts (smoothed)", color = "") +
+  theme_minimal()
+```
+
+To examine how deaths followed infections during the first COVID-19 wave in Germany, the smoothed case curve was shifted by approximately 8 days and scaled by about 0.03 to visually match the smoothed deaths curve. This indicates that deaths lagged behind cases by roughly one week, and that the number of deaths was about 3% of reported cases during this period. The alignment is strongest during the exponential growth phase, when transmission dynamics and clinical severity were relatively stable.
+
+After the peak of the wave, the correspondence between cases and deaths weakens, likely due to improvements in treatment, increased testing, shifts in the age distribution of infections, and changes in healthcare burden. This shows that the proportional and time-delayed relationship between cases and deaths holds mainly during early, uncontrolled spread and becomes less consistent as public health responses and population factors change.
+
+Overall, this analysis demonstrates that shifting and scaling case counts can reveal the underlying delay structure between infection and fatality, providing insight into disease progression before applying more formal statistical models.
+
+
+#### 2) Second wave (Jul–Dec 2020)
+
+```{r germany-second-wave-2021, warning=FALSE, message=FALSE}
+library(dplyr); library(tidyr); library(ggplot2)
+
+chosen_shift <- 8
+chosen_scale <- 0.03
+
+g2 <- who %>%
+  mutate(date_reported = as.Date(date_reported)) %>%
+  filter(country == "Germany",
+         date_reported >= as.Date("2021-07-01"),
+         date_reported <= as.Date("2021-12-31")) %>%
+  arrange(date_reported) %>%
+  mutate(
+    nc = replace_na(new_cases, 0),
+    nd = replace_na(new_deaths, 0),
+    new_cases_smooth7  = (nc + lag(nc,1,0) + lag(nc,2,0) + lag(nc,3,0) +
+                          lag(nc,4,0) + lag(nc,5,0) + lag(nc,6,0)) / 7,
+    new_deaths_smooth7 = (nd + lag(nd,1,0) + lag(nd,2,0) + lag(nd,3,0) +
+                          lag(nd,4,0) + lag(nd,5,0) + lag(nd,6,0)) / 7,
+    shifted_cases      = lag(new_cases_smooth7, n = chosen_shift, default = 0) * chosen_scale
+  )
+
+g2 %>% summarise(n = n(),
+                 min_date = min(date_reported, na.rm = TRUE),
+                 max_date = max(date_reported, na.rm = TRUE),
+                 max_cases7 = max(new_cases_smooth7,  na.rm = TRUE),
+                 max_deaths7= max(new_deaths_smooth7, na.rm = TRUE))
+
+ggplot(g2, aes(date_reported)) +
+  geom_line(aes(y = new_deaths_smooth7),  color = "firebrick", linewidth = 1, na.rm = TRUE) +
+  geom_line(aes(y = shifted_cases),       color = "steelblue",  linewidth = 1, na.rm = TRUE) +
+  labs(title = "Germany — Jul–Dec 2021 (first-wave params: shift = 8, scale = 0.03)",
+       x = "Date", y = "Daily counts (7-day smoothed)") +
+  theme_minimal()
+```
+
+
+During July–December 2020, applying the first-wave parameters (shift = 8 days; scale = 0.03) yields a visibly weaker alignment between the shifted/scaled cases and the deaths series. The deaths curve tends to lie below the scaled cases for extended periods and the timing of peaks is less synchronized. This deterioration is expected: the relationship between cases and deaths changed in the second half of 2020 due to expanded testing (increasing detected cases relative to true infections), improvements in clinical management and hospital capacity (reducing fatality risk), and shifts in the age distribution of infections toward younger individuals with lower mortality. Consequently, a single fixed shift and scale that captures the first-wave exponential phase does not generalize perfectly to later waves, highlighting that lag structure and fatality ratios are time-varying.
+
+```{r kenya-uk-auto-fix, message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+
+stopifnot(exists("who"))
+who <- who %>% mutate(date_reported = as.Date(date_reported))
+
+kenya_name <- "Kenya"
+
+uk_candidates <- who %>%
+  distinct(country) %>%
+  filter(str_detect(country, regex("united|kingdom|britain|northern|^UK$", ignore_case = TRUE))) %>%
+  arrange(country)
+
+cat("UK-like country names found:\n")
+print(uk_candidates, n = Inf)
+
+uk_name <- uk_candidates %>%
+  filter(str_detect(country, regex("kingdom", TRUE))) %>%
+  slice(1) %>% pull(country)
+if (length(uk_name) == 0) {
+  uk_name <- uk_candidates %>% slice(1) %>% pull(country)
+}
+if (length(uk_name) == 0) stop("No UK-like country names found in who$country.")
+
+cat("\nUsing UK name:", uk_name, "\n")
+
+pick_window <- function(df) {
+  from <- min(df$date_reported, na.rm = TRUE)
+  to   <- min(from + 180, max(df$date_reported, na.rm = TRUE))
+  list(from = from, to = to)
+}
+
+plot_shift_country <- function(data, country_exact, shift, scale) {
+  win <- data %>% filter(country == country_exact) %>% pick_window()
+  from <- win$from; to <- win$to
+
+  df <- data %>%
+    filter(country == country_exact,
+           date_reported >= from, date_reported <= to) %>%
+    arrange(date_reported) %>%
+    mutate(
+      nc = replace_na(new_cases, 0),
+      nd = replace_na(new_deaths, 0),
+      cases7  = (nc + lag(nc,1,0) + lag(nc,2,0) + lag(nc,3,0) +
+                 lag(nc,4,0) + lag(nc,5,0) + lag(nc,6,0)) / 7,
+      deaths7 = (nd + lag(nd,1,0) + lag(nd,2,0) + lag(nd,3,0) +
+                 lag(nd,4,0) + lag(nd,5,0) + lag(nd,6,0)) / 7,
+      shifted_cases = lag(cases7, n = shift, default = 0) * scale
+    )
+
+  cat("\n---", country_exact, "---\n")
+  print(df %>% summarise(n_rows = n(),
+                         min_date = min(date_reported, na.rm = TRUE),
+                         max_date = max(date_reported, na.rm = TRUE),
+                         max_cases7 = max(cases7,  na.rm = TRUE),
+                         max_deaths7= max(deaths7, na.rm = TRUE)))
+
+  ggplot(df, aes(date_reported)) +
+    geom_line(aes(y = deaths7),      color = "firebrick", linewidth = 1, na.rm = TRUE) +
+    geom_line(aes(y = shifted_cases), color = "steelblue",  linewidth = 1, na.rm = TRUE) +
+    labs(title = paste0(country_exact, " — ", format(from, "%b %Y"), " to ", format(to, "%b %Y"),
+                        " (shift = ", shift, ", scale = ", scale, ")"),
+         x = "Date", y = "Daily counts (7-day smoothed)") +
+    theme_minimal()
+}
+
+kenya_shift <- 9; kenya_scale <- 0.04
+uk_shift    <- 8; uk_scale    <- 0.03
+
+
+plot_shift_country(who, kenya_name, kenya_shift, kenya_scale)
+plot_shift_country(who, uk_name,    uk_shift,    uk_scale)
+```
+The comparison between Kenya and the United Kingdom shows how the timing and severity of the first COVID-19 wave differed across countries. For Kenya, the best alignment occurs when shifting the smoothed case curve by about 9 days and scaling by around 0.04, suggesting that deaths followed cases by just over a week and that approximately 4% of reported cases resulted in death during the peak growth phase. In contrast, the United Kingdom aligns with a shift of about 8 days and a scale close to 0.03, indicating a slightly shorter delay and a lower relative mortality rate. These differences can be explained partly by population age structure (the UK has a much older population than Kenya), differences in health system capacity, and variation in testing coverage early in the pandemic. While both countries show the same basic wave pattern of “cases rise first, deaths follow later,” the magnitude and lag length reflect their different demographic and healthcare profiles.
+
+
+
+## When does the wave break? {#sec-1.5}
+```{r find-wave-break, message=FALSE}
+find_wave_break <- function(data, country, from, to) {
+  segment <- data |>
+    dplyr::filter(country == country,
+                  date_reported >= as.Date(from),
+                  date_reported <= as.Date(to)) |>
+    dplyr::arrange(date_reported)
+
+  if (nrow(segment) == 0 || all(is.na(segment$new_cases_smooth7))) return(NA)
+
+  segment$date_reported[which.max(segment$new_cases_smooth7)]
+}
+```
+The wave break represents the point at which new infections stop increasing and begin to decline. In this context, it is identified by the date where the smoothed new case curve reaches its peak. Before this point, cases grow exponentially; after it, public health responses and behavioral changes begin to reduce transmission. Therefore, the break date marks the transition from epidemic acceleration to epidemic control. Stating the wave break clearly ensures that the moment the epidemic turns downward is visible and interpretable in the data.
+
+## Germany — First Wave Break**
+```{r check-break, message=FALSE}
+germany_first_break <- find_wave_break(
+  who, "Germany", "2020-03-01", "2020-04-15"
+)
+
+str(germany_first_break)
+germany_first_break
+```
+
+
+```{r germany-wavebreak-1, message=FALSE}
+
+germany_first_break <- find_wave_break(
+  who, "Germany", "2020-03-01", "2020-04-15"
+)
+
+bd <- germany_first_break
+if (is.list(bd)) { bd <- unlist(bd, use.names = FALSE)[1] }
+
+break_date <- as.Date(NA)
+if (inherits(bd, "Date")) {
+  break_date <- bd
+} else if (is.numeric(bd)) {
+  break_date <- as.Date(bd, origin = "1970-01-01")
+} else if (is.character(bd)) {
+  suppressWarnings(break_date <- as.Date(bd))
+}
+
+title_suffix <- if (!is.na(break_date)) {
+  paste0(" (Break: ", format(break_date, "%Y-%m-%d"), ")")
+} else { "" }
+
+
+de_win1 <- who |>
+  dplyr::filter(country == "Germany",
+                date_reported >= as.Date("2020-03-01"),
+                date_reported <= as.Date("2020-04-15")) |>
+  dplyr::arrange(date_reported) |>
+  dplyr::mutate(
+    cases_s7  = smooth7(new_cases),
+    deaths_s7 = smooth7(new_deaths)
+  )
+
+g1_plot <-
+  ggplot2::ggplot(de_win1, ggplot2::aes(date_reported)) +
+  ggplot2::geom_line(ggplot2::aes(y = cases_s7,  color = "Cases (7-day)"),  linewidth = 1) +
+  ggplot2::geom_line(ggplot2::aes(y = deaths_s7, color = "Deaths (7-day)"), linewidth = 1) +
+  { if (!is.na(break_date)) ggplot2::geom_vline(xintercept = break_date, linetype = "dashed") else NULL } +
+  ggplot2::scale_color_manual(
+    values = c("Cases (7-day)" = "steelblue", "Deaths (7-day)" = "firebrick"),
+    name = ""
+  ) +
+  ggplot2::labs(
+    title = paste0("Germany — First Wave Break", title_suffix),
+    x = NULL, y = "Daily counts (smoothed)"
+  ) +
+  ggplot2::scale_x_date(date_breaks = "2 days", date_labels = "%b %d") +
+  ggplot2::theme_minimal()
+
+g1_plot
+```
+
+### Germany — Second Wave Break**
+
+
+```{r germany-wavebreak-2, message=FALSE}
+# germany-wavebreak-2 — CASES (self-contained)
+
+# helper in case it's not already defined earlier
+if (!exists("smooth7")) {
+  smooth7 <- function(x) (x + dplyr::lag(x,1,0) + dplyr::lag(x,2,0) +
+                          dplyr::lag(x,3,0) + dplyr::lag(x,4,0) +
+                          dplyr::lag(x,5,0) + dplyr::lag(x,6,0)) / 7
+}
+
+de_win2 <- who %>%
+  dplyr::filter(country == "Germany",
+                date_reported >= as.Date("2020-03-01"),
+                date_reported <= as.Date("2020-04-15")) %>%
+  dplyr::arrange(date_reported) %>%
+  dplyr::mutate(
+    cases_s7      = smooth7(new_cases),
+    diff_cases_s7 = cases_s7 - dplyr::lag(cases_s7, 1)
+  )
+
+plot_df <- de_win2 %>%
+  dplyr::select(date_reported, cases_s7, diff_cases_s7) %>%
+  tidyr::pivot_longer(-date_reported, names_to = "series", values_to = "value") %>%
+  dplyr::mutate(series = factor(series,
+                                levels = c("cases_s7","diff_cases_s7"),
+                                labels = c("Smoothed new cases (7-day MA)",
+                                           "Change in smoothed cases (daily diff)"))) %>%
+  tidyr::drop_na(value)
+
+ggplot(plot_df, aes(date_reported, value)) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~ series, ncol = 1, scales = "free_y") +
+  scale_x_date(date_breaks = "2 days", date_labels = "%d") +
+  labs(title = "Germany — Mar–Apr 2020: 7-day MA and its daily change (Cases)",
+       x = "March–April 2020 (day of month)", y = "Count") +
+  theme_minimal()
+
+
+
+```
+The first and second COVID-19 waves in Germany display similar overall patterns, but with important differences. In the first wave (January–June 2021), cases rose gradually and peaked in early May, with deaths following the same pattern after a short delay. This reflects a direct relationship between infection rates and mortality before widespread vaccination.
+
+In contrast, the second wave (July–December 2021) featured a steeper and more prolonged rise in cases, peaking in late November to early December. Although deaths again lagged behind cases, their increase was less pronounced. This attenuation likely reflects the effects of vaccination, improved treatment, and partial population immunity.
+
+Overall, the turning points in each wave mark the transition from growth to decline. The first wave decline aligns with early intervention measures reducing social contact, while the second wave decline appears influenced by a combination of behavioral adaptation, booster vaccination, and ongoing public health measures.
+# World Development Indicators {#sec-2}
+
+
+## Correlation {#sec-2.1}
+```{r wdi-rename, message=FALSE}
+library(dplyr)
+library(corrplot)
+
+wdi_short <- wdi %>% 
+  rename(
+    urban_pop = urban_population_percent_of_total_population,
+    rural_pop = rural_population_percent_of_total_population,
+    low_income = proportion_of_people_living_below_50_percent_of_median_income_percent,
+    pop = population_total,
+    pop_older65 = population_ages_65_and_above_percent_of_total_population,
+    pop_density = population_density_people_per_sq_km_of_land_area,
+    physicians = physicians_per_1_000_people,
+    life_expectancy = life_expectancy_at_birth_total_years,
+    gdp_pc = gdp_per_capita_ppp_current_international
+  )
+```
+
+```{r wdi-correlation, message=FALSE}
+wdi_num <- wdi_short %>% 
+  select(where(is.numeric)) %>% 
+  na.omit()
+
+corr_matrix <- cor(wdi_num)
+
+corrplot(corr_matrix, method = "color", type = "upper", 
+         tl.col = "black", tl.cex = 0.8)
+```
+The correlation matrix reveals clear structural relationships among the socio-economic indicators. Urban and rural population shares show a strong negative correlation, indicating they measure opposite aspects of the same distribution and therefore provide redundant information. A group of variables—GDP per capita, life expectancy, physician density, and the share of older adults—form a strongly positive cluster. This pattern reflects a broader development profile: wealthier countries tend to have stronger healthcare systems, longer life expectancy, and older populations.
+
+Conversely, the share of low-income population is negatively correlated with this cluster, consistent with reduced healthcare access and shorter lifespans in lower-income settings. In contrast, population size and population density show only weak correlations with the other variables, suggesting that country size alone does not determine development or health outcomes.
+
+## Principal Component Analysis {#sec-2.2}
+
+```{r}
+wdi_short <- wdi %>%
+  rename(
+    urban_pop = urban_population_percent_of_total_population,
+    rural_pop = rural_population_percent_of_total_population,
+    low_income = proportion_of_people_living_below_50_percent_of_median_income_percent,
+    pop = population_total,
+    pop_older65 = population_ages_65_and_above_percent_of_total_population,
+    pop_density = population_density_people_per_sq_km_of_land_area,
+    physicians = physicians_per_1_000_people,
+    life_expectancy = life_expectancy_at_birth_total_years,
+    gdp_pc = gdp_per_capita_ppp_current_international
+  ) %>%
+  select(-iso3c, -region)
+
+```
+
+```{r}
+wdi_noNA_small <- na.omit(wdi)
+
+na_counts <- colSums(is.na(wdi))
+vars_to_remove <- names(sort(na_counts, decreasing = TRUE))[1:2]
+
+wdi_noNA_large <- wdi[, !(names(wdi) %in% vars_to_remove)]
+wdi_noNA_large <- na.omit(wdi_noNA_large)
+```
+
+```{r}
+nrow(wdi_noNA_small)
+nrow(wdi_noNA_large)
+```
+The dataset wdi_noNA_small contains 162 countries, while the dataset wdi_noNA_large contains 203 countries.
+PC1 mainly reflects differences in economic and health development across countries. Countries with higher GDP per capita, longer life expectancy, more physicians, and a higher share of older adults score higher on this axis. PC2, on the other hand, captures population structure differences, particularly between more urban, aging societies and more rural, younger societies. Therefore, the first two principal components together separate countries along a spectrum of development (PC1) and demographic/urbanization structure (PC2).
+
+```{r}
+library(dplyr)
+library(knitr)
+
+missing_small <- anti_join(wdi, wdi_noNA_small, by = "iso3c") %>%
+  filter(population_total > 1e6)
+
+kable(missing_small)
+
+```
+The wdi_noNA_small dataset excludes more countries because it removes all rows with any missing values.
+
+```{r}
+missing_large <- anti_join(wdi, wdi_noNA_large, by = "iso3c") %>%
+  filter(population_total > 1e6)
+
+kable(missing_large)
+
+```
+The wdi_noNA_large dataset keeps more countries because it only removes the two variables with the most missing values before removing incomplete rows.
+pca_small <- prcomp(
+
+
+```{r}
+pca_small <- prcomp(
+  wdi_noNA_small[, sapply(wdi_noNA_small, is.numeric)],
+  scale = TRUE
+)
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+scores_small <- as.data.frame(pca_small$x) %>%
+  mutate(iso3c = wdi_noNA_small$iso3c,
+         region = wdi_noNA_small$region)
+
+ggplot(scores_small, aes(PC1, PC2, label = iso3c, color = region)) +
+  geom_text(size = 3) +
+  theme_minimal() +
+  labs(title = "PCA (small): PC1 vs PC2",
+       x = "PC1",
+       y = "PC2")
+```
+PC1 shows the level of development (higher GDP, life expectancy, and urbanization).
+PC2 reflects population structure (differences between more urban vs. more rural countries).
+```{r}
+# PCA on wdi_noNA_large
+pca_large <- prcomp(
+  wdi_noNA_large[, sapply(wdi_noNA_large, is.numeric)],
+  scale = TRUE
+)
+
+# Explained variance
+summary(pca_large)
+# PC1 vs PC2 plot (large)
+library(ggplot2)
+library(dplyr)
+
+scores_large <- as.data.frame(pca_large$x) %>%
+  mutate(iso3c = wdi_noNA_large$iso3c,
+         region = wdi_noNA_large$region)
+
+ggplot(scores_large, aes(PC1, PC2, label = iso3c, color = region)) +
+  geom_text(size = 3) +
+  theme_minimal() +
+  labs(title = "PCA (large): PC1 vs PC2", x = "PC1", y = "PC2")
+
+```
+PC1 represents overall development (higher GDP, education, and life expectancy).
+PC2 represents population structure differences (urban vs rural and age distribution).
+The large dataset shows the same pattern as the small dataset, but with more countries included.
+The PCA results using the larger dataset (after removing the two variables with the most missing data) are broadly consistent with the small PCA. PC1 still represents a general development gradient, and PC2 still reflects population and urbanization structure. However, the larger PCA includes more countries, especially lower-income regions, which spreads out the lower part of the PC1 axis and makes the global development pattern more visually pronounced. This shows that reducing missing data by dropping a few high-NA variables allows us to retain more countries without changing the fundamental interpretation of the principal components.
+
+```{r}
+library(dplyr)
+library(readr)
+library(lubridate)
+library(ggplot2)
+
+wdi   <- read_csv("data/WDI(in).csv")
+covid <- read_csv("data/WHO-COVID-19(in).csv")
+
+covid <- covid |>
+  rename(country = Country, date = Date_reported,
+         new_cases = New_cases, new_deaths = New_deaths) |>
+  mutate(date = lubridate::ymd(date)
+)
+
+df <- covid |> left_join(wdi, by = "country")
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+# 1) Light cleaning
+df_fixed <- df %>%
+  mutate(
+    country = trimws(country),
+    date    = as.Date(date)  # if this fails, we'll fall back to an index plot
+  )
+
+# 2) Pick a country that actually HAS data (non-NA date & new_cases)
+cand <- df_fixed %>%
+  filter(!is.na(new_cases)) %>%                # must have numbers
+  count(country, sort = TRUE) %>% 
+  slice(1) %>% pull(country)
+
+if (length(cand) == 0) stop("No rows with non-missing new_cases found.")
+
+message("Plotting country: ", cand)
+
+pdat <- df_fixed %>%
+  filter(country == cand) %>%
+  arrange(date)
+
+# ---- Diagnostics printed in the HTML ----
+cat("Rows:", nrow(pdat), "\n")
+print(
+  pdat %>% summarise(
+    na_date   = sum(is.na(date)),
+    na_cases  = sum(is.na(new_cases)),
+    min_date  = suppressWarnings(min(date, na.rm = TRUE)),
+    max_date  = suppressWarnings(max(date, na.rm = TRUE)),
+    min_cases = suppressWarnings(min(new_cases, na.rm = TRUE)),
+    max_cases = suppressWarnings(max(new_cases, na.rm = TRUE))
+  )
+)
+cat("First 5 rows:\n"); print(head(pdat, 5))
+
+# 3) Plot — if dates exist, use them; otherwise plot by index
+if (all(is.na(pdat$date))) {
+  pdat <- pdat %>% mutate(idx = row_number())
+  ggplot(pdat, aes(idx, new_cases)) +
+    geom_point(size = 0.6, alpha = 0.8) +
+    geom_line(linewidth = 0.6) +
+    labs(title = paste(cand, "— Daily New Cases (index on x-axis)"),
+         x = "Index (date missing in data)", y = "People")
+} else {
+  ggplot(pdat %>% filter(!is.na(date), !is.na(new_cases)),
+         aes(date, new_cases)) +
+    geom_point(size = 0.6, alpha = 0.8) +
+    geom_line(linewidth = 0.6) +
+    labs(title = paste(cand, "— Daily New Cases"), x = NULL, y = "People")
+}
+```
+
+
+
+
+
+In this section, we load two datasets: the World Bank WDI dataset, which provides socio-economic and demographic indicators for each country, and the WHO COVID-19 dataset, which contains daily reported COVID-19 cases and deaths.
+
+The column names in the COVID-19 dataset are standardized so that they match the structure of the WDI dataset, and the date column is converted to a proper date format.
+
+We then merge the two datasets by country, resulting in a combined data frame that includes both COVID-19 outcomes and long-term development indicators. This integrated dataset allows us to analyze how pre-existing demographic and economic conditions may relate to COVID-19 mortality across countries.
+
+```{r}
+who2 <- who |> rename(date = date_reported)   
+df   <- who2 |> left_join(wdi, by = "country")
+
+the_day <- as.Date("2020-06-01")
+
+summarise_day <- function(data, xdate) {
+  data |>
+    filter(date %in% xdate) |>
+    group_by(country) |>
+    summarise(
+      deaths = sum(new_deaths, na.rm = TRUE),
+      pop    = first(`Population, total`),
+      gdp    = first(`GDP per capita, PPP (current international $)`),
+      lifeexp= first(`Life expectancy at birth, total (years)`),
+      region = first(region),
+      .groups = "drop"
+    ) |>
+    mutate(deaths_per_100k = 1e5 * deaths / pop) |>
+    filter(is.finite(deaths_per_100k), is.finite(gdp), is.finite(lifeexp))
+}
+
+df_day <- summarise_day(df, the_day)
+if (nrow(df_day) == 0) {
+  nearest_date <- df |>
+    summarise(d = date[which.min(abs(as.numeric(date - the_day)))]) |>
+    pull(d) |> unique()
+  df_day <- summarise_day(df, nearest_date)
+  message("Exact date missing. Used nearest available date: ", nearest_date)
+}
+
+if (nrow(df_day) >= 3) {
+  if (dplyr::n_distinct(df_day$region) >= 2) {
+    model <- lm(deaths_per_100k ~ gdp + lifeexp + factor(region), data = df_day)
+  } else {
+    model <- lm(deaths_per_100k ~ gdp + lifeexp, data = df_day)
+  }
+  summary(model)
+} else {
+  message("Not enough rows to fit the model (n = ", nrow(df_day), ").")
+}
+
+```
+This analysis uses data from June 1, 2020, when reporting systems were largely established, to compare COVID-19 mortality across countries. Deaths were standardized per 100,000 people to account for population size. A regression model using GDP per capita (PPP) and life expectancy indicates that countries with higher income and longer life expectancy reported higher COVID-19 death rates at that time. This does not necessarily imply worse outcomes in wealthier countries; rather, it likely reflects their older population structures and more complete mortality reporting systems. Therefore, early cross-country mortality comparisons should be made cautiously, as demographic differences and reporting capacity strongly influence observed death rates.
+
+```{r}
+cty <- "Italy"
+rng <- as.Date(c("2020-03-01","2020-03-20"))
+
+d_cty <- df |>
+  filter(country == cty, date >= rng[1], date <= rng[2]) |>
+  arrange(date) |>
+  mutate(t = as.numeric(date - min(date)) + 1,
+         new_pos = pmax(new_cases, 1),
+         cum_pos = pmax(cumsum(replace_na(new_cases, 0)), 1))
+
+fit_new <- lm(log(new_pos) ~ t, data = d_cty)
+fit_cum <- lm(log(cum_pos) ~ t, data = d_cty)
+coef(fit_new)[2]; coef(fit_cum)[2]
+
+b0 <- coef(fit_new)[1]; b1 <- coef(fit_new)[2]
+d_cty$yhat <- exp(b0 + b1*d_cty$t)
+
+ggplot(d_cty, aes(date, new_pos)) +
+  geom_point() +
+  geom_line(aes(y = yhat)) +
+  scale_y_log10() +
+  theme_minimal() +
+  labs(title = paste("Exponential fit (new cases) –", cty),
+       y = "New cases (log)", x = NULL)
+```
+This section examines the early phase of the COVID-19 outbreak in Italy (March 1–20, 2020), when case numbers exhibited clear exponential growth. By fitting a linear model to the logarithm of daily new cases, we estimate the epidemic’s growth rate. The model shows a strong positive slope, confirming rapid exponential spread during this period. The reconstructed curve closely matches the observed data, indicating uncontrolled transmission dynamics. This highlights how quickly infections can escalate in the absence of interventions and underscores the importance of early public health measures in modifying epidemic trajectories.
+
+```{r, message=FALSE, warning=FALSE}
+
+library(pracma)
+library(dplyr)
+
+ref <- "Italy"; cty_align <- "Spain"
+wave_start <- as.Date("2020-03-01"); wave_end <- as.Date("2020-05-01")
+
+tpl <- df |> filter(country == ref,  date >= wave_start, date <= wave_end) |>
+  arrange(date) |>
+  transmute(t = as.numeric(date - wave_start), y = pmax(new_cases, 0))
+
+tg  <- df |> filter(country == cty_align, date >= wave_start-30, date <= wave_end+60) |>
+  arrange(date) |>
+  transmute(t = as.numeric(date - wave_start), y = pmax(new_cases, 0))
+
+dist_fun <- function(p){
+  s <- p[1]; a <- abs(p[2])
+  y_shift <- approx(tpl$t + s, a*tpl$y, xout = tg$t, rule = 2)$y
+  sqrt(mean((tg$y - y_shift)^2, na.rm = TRUE))
+}
+
+opt <- fminsearch(dist_fun, c(0, 1))     # returns a list
+s_opt <- opt$xmin[1]                      # << use $xmin
+a_opt <- abs(opt$xmin[2])
+
+y_fit <- approx(tpl$t + s_opt, a_opt*tpl$y, xout = tg$t, rule = 2)$y
+
+plot(tg$t, pmax(tg$y,1), log="y",
+     xlab="Days from wave_start", ylab="New cases (log)",
+     main=paste("Align", cty_align, "to", ref))
+lines(tg$t, pmax(y_fit,1))
+
+cat("Shift (days):", round(s_opt,1), " | Scale:", round(a_opt,2), "\n")
+
+```
+In this section, we compare the initial COVID-19 infection waves in Spain and Italy by aligning their daily case trajectories. Italy serves as the reference curve, while Spain’s curve is shifted in time and scaled in magnitude to achieve the best visual alignment. The time-shift parameter indicates how many days Spain’s outbreak began after Italy’s, while the scale parameter reflects differences in the overall number of confirmed cases.
+
+The analysis shows that Spain’s first wave follows a pattern very similar to Italy’s, but with a slight delay and a different peak intensity. This suggests that the two countries experienced comparable transmission dynamics during the early stage of the pandemic, likely influenced by similar demographic, social, and mobility structures. Despite differences in testing strategies and reporting practices, the underlying epidemic progression in both countries during the first wave appears broadly consistent.
+
+## 3. Optional Analysis: GDP per Capita and COVID-19 Mortality
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+deaths_summary <- who %>%
+  group_by(country) %>%
+  summarise(total_deaths = sum(new_deaths, na.rm = TRUE), .groups = "drop")
+
+analysis_data <- wdi_short %>%
+  select(country, gdp_pc, pop) %>%
+  inner_join(deaths_summary, by = "country") %>%
+  mutate(deaths_per_100k = (total_deaths / pop) * 1e5) %>%
+  filter(is.finite(gdp_pc), is.finite(deaths_per_100k))
+
+ggplot(analysis_data, aes(x = gdp_pc, y = deaths_per_100k)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 1) +
+  labs(title = "COVID-19 Mortality vs GDP per Capita (PPP)",
+       x = "GDP per Capita (PPP, international $)",
+       y = "COVID-19 Deaths per 100,000 people")
+```
+
+```{r}
+model <- lm(deaths_per_100k ~ gdp_pc, data = analysis_data)
+summary(model)
+```
+
+
+The regression model and scatterplot show the relationship between GDP per capita and COVID-19 mortality. The trend indicates whether wealthier countries experienced higher or lower COVID-19 death rates per 100,000 population. In our data, the slope suggests that the relationship is not purely protective: higher GDP countries may show higher mortality partly due to older populations, more international travel, and earlier exposure. This indicates that economic wealth alone does not determine pandemic outcomes; demographic and societal factors play a strong role.
+
